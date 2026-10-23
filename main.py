@@ -10,12 +10,13 @@ URL_INFO = "https://valladolid.publicbikesystem.net/customer/gbfs/v2/en/station_
 
 app = FastAPI()
 
+# Inicialización del cliente Supabase
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL else None
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if (SUPABASE_URL and SUPABASE_KEY) else None
 
 def sincronizar_estaciones():
-    """Actualiza o inserta la información fija (coordenadas, capacidad, nombre)."""
+    """Actualiza o inserta la dimensión estática (coordenadas, capacidad y nombre)."""
     try:
         response = requests.get(URL_INFO, timeout=10).json()
         estaciones_data = []
@@ -27,7 +28,8 @@ def sincronizar_estaciones():
                 "lon": est.get('lon'),
                 "capacity": est.get('capacity')
             })
-        # Upsert: inserta si no existe, actualiza si ya existe por 'id'
+        
+        # Upsert por clave primaria 'id'
         supabase.table("estaciones").upsert(estaciones_data).execute()
         return True
     except Exception as e:
@@ -36,10 +38,12 @@ def sincronizar_estaciones():
 
 @app.get("/")
 def home():
-    return {"mensaje": "API BIKI 2.0 (Arquitectura 2 tablas) operativa."}
+    return {"mensaje": "API BIKI 2.0 (Telemetría y Gemelo Digital) operativa. Usa /recolectar."}
 
 @app.get("/sync-estaciones")
 def endpoint_sync():
+    if not supabase:
+        return {"status": "error", "detalle": "Variables de entorno Supabase no configuradas"}
     ok = sincronizar_estaciones()
     return {"status": "ok" if ok else "error"}
 
@@ -52,17 +56,25 @@ def lanzar_recoleccion():
         status_data = requests.get(URL_STATUS, timeout=10).json()
         ahora = datetime.datetime.now(timezone('Europe/Madrid')).isoformat()
         
+        # 1. Verificar integridad referencial contra la tabla 'estaciones'
+        res_ids = supabase.table("estaciones").select("id").execute()
+        ids_existentes = {str(fila['id']) for fila in res_ids.data} if res_ids.data else set()
+        
+        ids_en_status = {str(est['station_id']) for est in status_data['data']['stations']}
+        
+        # Sincroniza si la tabla está vacía o si el feed incluye una estación aún no catalogada
+        if not ids_existentes or not ids_en_status.issubset(ids_existentes):
+            sincronizar_estaciones()
+
+        # 2. Estructurar la telemetría dinámica
         registros_estados = []
         for est in status_data['data']['stations']:
-            # Conteo discriminado de vehículos
             electricas = sum(t['count'] for t in est.get('vehicle_types_available', []) if t.get('vehicle_type_id') == "EFIT")
             normales = sum(t['count'] for t in est.get('vehicle_types_available', []) if t.get('vehicle_type_id') == "FIT")
             
-            # Conversión de timestamp nativo Unix a ISO (si existe)
             last_reported_ts = est.get('last_reported')
             last_rep_iso = datetime.datetime.fromtimestamp(last_reported_ts, tz=datetime.timezone.utc).isoformat() if last_reported_ts else None
 
-            # Estados operativos booleanos (1 = True, 0 = False)
             is_renting = bool(est.get('is_renting', 1))
             is_returning = bool(est.get('is_returning', 1))
 
@@ -81,7 +93,7 @@ def lanzar_recoleccion():
                 "is_returning": is_returning
             })
         
-        # Volcado de telemetría a la tabla 'estados'
+        # 3. Inserción en lote en 'estados'
         supabase.table("estados").insert(registros_estados).execute()
         return {"status": "ok", "registradas": len(registros_estados)}
 
